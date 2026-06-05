@@ -88,6 +88,18 @@ Firmware for the **ESP32-S3-N16R8** that converts an IBM KB-8926 PS/2 keyboard i
 
 ## Wiring Diagram
 
+## ESP32-S3 N16R8 Generic Boards
+
+Some generic ESP32-S3 N16R8 development boards do **not** connect the USB input voltage to the 5V pin by default.
+
+To make **5V available on the 5V pin**, you must bridge the **IN-OUT** solder pads on the back/front of the board (depending on the board revision).
+
+After bridging these pads, the board's USB 5V supply will be available on the 5V pin and can be used to power the PS/2 keyboard.
+
+![ESP32-S3 N16R8 IN-OUT Pads](/Images/esp32_s3_in_out.png)
+
+---
+
 ```
     IBM KB-8926 (PS/2)                    ESP32-S3-N16R8
     ==================                    ==============
@@ -152,7 +164,7 @@ Select the following settings under **Tools** menu:
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/LeoYab/Mod_KB8926_USB_BT.git
+   git clone https://github.com/LeoYab/Mod_KB-8926_USB_BT
    ```
 
 2. Open `Mod_KB8926_USB_BT.ino` in the Arduino IDE.
@@ -181,7 +193,7 @@ All shortcuts use the **Right Ctrl** key as the modifier. Press and hold Right C
 | `Right Ctrl + 2` | Switch to BT2 | Activates Bluetooth profile 2. Device restarts. |
 | `Right Ctrl + 3` | Switch to BT3 | Activates Bluetooth profile 3. Device restarts. |
 | `Right Ctrl + 4` | Switch to USB | Activates USB HID mode. Device restarts. |
-| `Right Ctrl + 0` | Factory Reset | Erases all settings, bonding data, and LED states. Device restarts. |
+| `Right Ctrl + 0 (hold 3 seconds)` | Factory Reset | Hold Right Ctrl + 0 for 3 seconds to erase all settings, bonding data, and LED states. Device restarts. |
 
 > The selected mode is saved to flash memory and persists across power cycles. The device will boot into the last selected mode.
 
@@ -197,7 +209,7 @@ The three keyboard LEDs (Num Lock, Caps Lock, Scroll Lock) provide visual feedba
 
 ### Factory Reset
 
-Press `Right Ctrl + 0` to perform a factory reset. This will:
+Press and hold `Right Ctrl + 0` for **3 seconds** to perform a factory reset. This will:
 
 - Clear all saved mode preferences
 - Erase all BLE bonding/pairing data from NVS
