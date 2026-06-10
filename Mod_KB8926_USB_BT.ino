@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include "USB.h"
 #include "USBHIDKeyboard.h"
+#include "USBHIDConsumerControl.h"
 #include <tusb.h>
 
 // --- PS/2 Pins ---------------------------------------------------------------
@@ -24,6 +25,11 @@ volatile bool    ledUpdatePending = false;
 volatile uint8_t pendingLedStatus = 0;
 volatile uint8_t localLedStatus = 0;
 volatile unsigned long last_interrupt_time = 0;
+
+// --- LED save debounce -------------------------------------------------------
+bool ledSavePending = false;
+unsigned long ledSaveTime = 0;
+const unsigned long LED_SAVE_DELAY_MS = 5000; // Save to flash 5 seconds after last change
 
 void IRAM_ATTR ps2interrupt() {
   unsigned long now = micros();
@@ -180,7 +186,7 @@ static void usbHidEventCallback(void* arg, esp_event_base_t event_base, int32_t 
       localLedStatus = ledStatus;
       pendingLedStatus = ledStatus;
       ledUpdatePending = true;
-      saveLedStatus(ledStatus);
+      saveLedStatusDeferred(ledStatus);
     }
   }
 }
@@ -208,7 +214,7 @@ private:
       localLedStatus = ledStatus;
       pendingLedStatus = ledStatus;
       ledUpdatePending = true;
-      saveLedStatus(ledStatus);
+      saveLedStatusDeferred(ledStatus);
     }
   }
 };
@@ -220,11 +226,13 @@ KeyboardMode currentMode = MODE_USB;
 
 // --- USB ---------------------------------------------------------------------
 USBHIDKeyboard usbKeyboard;
+USBHIDConsumerControl usbConsumer;
 
 // --- BLE ---------------------------------------------------------------------
 NimBLEServer*         bleServer = nullptr;
 NimBLEHIDDevice*      bleHid    = nullptr;
 NimBLECharacteristic* bleInput  = nullptr;
+NimBLECharacteristic* bleConsumer = nullptr;
 bool                  bleActive = false;
 
 // Each BLE profile uses a different MAC address so the host does not confuse
@@ -244,12 +252,17 @@ const char* bleNames[3] = {
 
 Preferences prefs;
 
-void saveLedStatus(uint8_t status) {
+void saveLedStatusNow(uint8_t status) {
   prefs.begin("keyboard", false);
   char key[8];
   sprintf(key, "led_%d", (int)currentMode);
   prefs.putUChar(key, status);
   prefs.end();
+}
+
+void saveLedStatusDeferred(uint8_t status) {
+  ledSavePending = true;
+  ledSaveTime = millis();
 }
 
 // --- PS/2 Set 2 -> HID Lookup Table -----------------------------------------
@@ -276,6 +289,16 @@ const PS2toHID ps2table[] = {
   {0x7E,0x47},
 };
 const int ps2tableSize = sizeof(ps2table) / sizeof(ps2table[0]);
+
+// --- O(1) Direct Lookup Array ------------------------------------------------
+uint8_t ps2ToHidMap[256];
+
+void initPs2ToHidMap() {
+  memset(ps2ToHidMap, 0, sizeof(ps2ToHidMap));
+  for (int i = 0; i < ps2tableSize; i++) {
+    ps2ToHidMap[ps2table[i].ps2] = ps2table[i].hid;
+  }
+}
 
 // --- PS/2 State --------------------------------------------------------------
 bool ps2_extended = false;
@@ -354,6 +377,23 @@ const uint8_t reportMap[] = {
   0x75, 0x03,
   0x91, 0x01,        //   Output (Constant) - padding
 
+  0xC0,              // End Collection
+
+  // --- Consumer Control Report ---
+  0x05, 0x0C,        // Usage Page (Consumer Devices)
+  0x09, 0x01,        // Usage (Consumer Control)
+  0xA1, 0x01,        // Collection (Application)
+  0x85, 0x02,        //   Report ID (2)
+  0x15, 0x00,        //   Logical Minimum (0)
+  0x25, 0x01,        //   Logical Maximum (1)
+  0x75, 0x01,        //   Report Size (1)
+  0x95, 0x02,        //   Report Count (2)
+  0x09, 0xE9,        //   Usage (Volume Increment)
+  0x09, 0xEA,        //   Usage (Volume Decrement)
+  0x81, 0x02,        //   Input (Data, Variable, Absolute)
+  0x95, 0x01,        //   Report Count (1)
+  0x75, 0x06,        //   Report Size (6)
+  0x81, 0x01,        //   Input (Constant) - padding to 1 byte
   0xC0               // End Collection
 };
 
@@ -370,6 +410,7 @@ class BLECallbacks : public NimBLEServerCallbacks {
     NimBLEDevice::startAdvertising();
   }
 };
+static BLECallbacks bleCallbacksInstance;
 
 void stopBLE() {
   if (!bleActive) return;
@@ -383,10 +424,11 @@ void stopBLE() {
   NimBLEDevice::stopAdvertising();
   NimBLEDevice::deinit(false); // false to preserve the bonding database in memory
   delay(200);
-  bleServer = nullptr;
-  bleHid    = nullptr;
-  bleInput  = nullptr;
-  bleActive = false;
+  bleServer   = nullptr;
+  bleHid      = nullptr;
+  bleInput    = nullptr;
+  bleConsumer = nullptr;
+  bleActive   = false;
   Serial.println("BLE stopped");
 }
 
@@ -407,14 +449,17 @@ void startBLE(int profile) {
   NimBLEDevice::setSecurityIOCap(3);               // 3 = No Input, No Output (Just Works)
 
   bleServer = NimBLEDevice::createServer();
-  bleServer->setCallbacks(new BLECallbacks(), true);
+  bleServer->setCallbacks(&bleCallbacksInstance, true);
 
-  bleHid   = new NimBLEHIDDevice(bleServer);
-  bleInput = bleHid->getInputReport(1);
+  bleHid      = new NimBLEHIDDevice(bleServer);
+  bleInput    = bleHid->getInputReport(1);
+  bleConsumer = bleHid->getInputReport(2);
 
   NimBLECharacteristic* bleOutput = bleHid->getOutputReport(1);
   if (bleOutput != nullptr) {
     bleOutput->setCallbacks(&bleOutputCallbacks);
+  } else {
+    Serial.println("WARNING: BLE getOutputReport(1) returned nullptr - LED callbacks not registered!");
   }
 
   bleHid->setManufacturer("IBM");
@@ -467,6 +512,18 @@ void usbSendReport() {
   usbKeyboard.sendReport(&r);
 }
 
+void bleSendVolume(uint8_t volumeMask) {
+  if (!bleActive || !bleServer || !bleConsumer) return;
+  if (bleServer->getConnectedCount() == 0) return;
+  uint8_t report = volumeMask; // bit 0 = Vol+, bit 1 = Vol-
+  bleConsumer->setValue(&report, 1);
+  bleConsumer->notify();
+  delay(10);
+  report = 0;
+  bleConsumer->setValue(&report, 1);
+  bleConsumer->notify();
+}
+
 void sendReport() {
   if (currentMode == MODE_USB) usbSendReport();
   else                         bleSendReport();
@@ -485,15 +542,13 @@ void factoryReset() {
 }
 
 uint8_t ps2ToHid(uint8_t ps2) {
-  for (int i = 0; i < ps2tableSize; i++)
-    if (ps2table[i].ps2 == ps2) return ps2table[i].hid;
-  return 0x00;
+  return ps2ToHidMap[ps2];
 }
 
 // --- Process Scan Code -------------------------------------------------------
 void processScanCode(uint8_t code) {
   if (pause_state > 0) {
-    const uint8_t pause_seq[7] = {0x14, 0x77, 0xE1, 0xF0, 0x14, 0xF0, 0x77};
+    static const uint8_t pause_seq[7] = {0x14, 0x77, 0xE1, 0xF0, 0x14, 0xF0, 0x77};
     if (code == pause_seq[pause_state - 1]) {
       pause_state++;
       if (pause_state == 8) {
@@ -526,6 +581,33 @@ void processScanCode(uint8_t code) {
   ps2_release  = false;
 
   if (ext && code == 0x14) { ps2_rightCtrl = !rel; return; }
+
+  if (ps2_rightCtrl) {
+    if (code == 0x79 || code == 0x55) { // Keypad + or Standard +
+      if (!rel) {
+        if (currentMode == MODE_USB) {
+          usbConsumer.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
+          usbConsumer.release();
+        } else {
+          bleSendVolume(0x01);
+        }
+        Serial.println("Volume Up triggered");
+      }
+      return;
+    }
+    if (code == 0x7B || code == 0x4E) { // Keypad - or Standard -
+      if (!rel) {
+        if (currentMode == MODE_USB) {
+          usbConsumer.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
+          usbConsumer.release();
+        } else {
+          bleSendVolume(0x02);
+        }
+        Serial.println("Volume Down triggered");
+      }
+      return;
+    }
+  }
 
   static unsigned long reset_press_time = 0;
   static bool reset_pressed = false;
@@ -614,25 +696,26 @@ void processScanCode(uint8_t code) {
     return;
   }
 
-  if (!rel) {
+  if (currentMode != MODE_USB && !rel) {
     if (hidCode == 0x39) { // Caps Lock
       localLedStatus ^= 0x04;
       pendingLedStatus = localLedStatus;
       ledUpdatePending = true;
-      saveLedStatus(localLedStatus);
+      saveLedStatusDeferred(localLedStatus);
     } else if (hidCode == 0x53) { // Num Lock
       localLedStatus ^= 0x02;
       pendingLedStatus = localLedStatus;
       ledUpdatePending = true;
-      saveLedStatus(localLedStatus);
+      saveLedStatusDeferred(localLedStatus);
     } else if (hidCode == 0x47) { // Scroll Lock
       localLedStatus ^= 0x01;
       pendingLedStatus = localLedStatus;
       ledUpdatePending = true;
-      saveLedStatus(localLedStatus);
+      saveLedStatusDeferred(localLedStatus);
     }
-    addKey(hidCode);
   }
+
+  if (!rel) addKey(hidCode);
   else      removeKey(hidCode);
   sendReport();
 }
@@ -665,9 +748,13 @@ void setup() {
     
     usbKeyboard.onEvent(usbHidEventCallback);
     usbKeyboard.begin();
+    usbConsumer.begin();
     USB.begin();
     delay(100);  // Reduced from 2000ms to 100ms
   }
+
+  // Initialize the O(1) PS/2 to HID lookup map
+  initPs2ToHidMap();
 
   pinMode(PS2_DATA,  INPUT_PULLUP);
   pinMode(PS2_CLOCK, INPUT_PULLUP);
@@ -687,7 +774,7 @@ void setup() {
     Serial.printf("IBM KB-8926 ready - BT%d mode\n", profile + 1);
   }
 
-  Serial.println("Shortcuts: Right Ctrl + 1/2/3 = BT1/BT2/BT3 | Right Ctrl + 4 = USB | Right Ctrl + 0 = Reset");
+  Serial.println("Shortcuts: Right Ctrl + 1/2/3 = BT1/BT2/BT3 | Right Ctrl + 4 = USB | Right Ctrl + +/- = Vol Up/Down | Right Ctrl + 0 = Reset");
 }
 
 // --- Connection State --------------------------------------------------------
@@ -722,8 +809,8 @@ void loop() {
       lastBlink = 0;
     }
     
-    // Blink all 3 LEDs (400ms on, 400ms off)
-    if (millis() - lastBlink > 400) {
+    // Blink all 3 LEDs (400ms on, 400ms off), but skip if shortcut is being used
+    if (!ps2_rightCtrl && millis() - lastBlink > 400) {
       lastBlink = millis();
       blinkState = !blinkState;
       setLeds(blinkState ? 0x07 : 0x00);
@@ -752,5 +839,12 @@ void loop() {
         setLeds(pendingLedStatus);
       }
     }
+  }
+
+  // --- Debounced LED save to flash ---
+  if (ledSavePending && (millis() - ledSaveTime >= LED_SAVE_DELAY_MS)) {
+    ledSavePending = false;
+    saveLedStatusNow(localLedStatus);
+    Serial.println("LED status saved to flash (debounced)");
   }
 }

@@ -193,6 +193,8 @@ All shortcuts use the **Right Ctrl** key as the modifier. Press and hold Right C
 | `Right Ctrl + 2` | Switch to BT2 | Activates Bluetooth profile 2. Device restarts. |
 | `Right Ctrl + 3` | Switch to BT3 | Activates Bluetooth profile 3. Device restarts. |
 | `Right Ctrl + 4` | Switch to USB | Activates USB HID mode. Device restarts. |
+| `Right Ctrl + +` (Numpad or Main) | Volume Up | Increases system volume. |
+| `Right Ctrl + -` (Numpad or Main) | Volume Down | Decreases system volume. |
 | `Right Ctrl + 0 (hold 3 seconds)` | Factory Reset | Hold Right Ctrl + 0 for 3 seconds to erase all settings, bonding data, and LED states. Device restarts. |
 
 > The selected mode is saved to flash memory and persists across power cycles. The device will boot into the last selected mode.
