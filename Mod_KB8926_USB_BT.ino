@@ -26,6 +26,12 @@ volatile uint8_t pendingLedStatus = 0;
 volatile uint8_t localLedStatus = 0;
 volatile unsigned long last_interrupt_time = 0;
 
+// --- Host LED control detection ---
+// When true, the connected BT host has sent at least one LED callback,
+// meaning it controls LED state itself. Local toggles are then disabled
+// to avoid double-toggling and desynchronization.
+volatile bool hostControlsLeds = false;
+
 // --- LED save debounce -------------------------------------------------------
 bool ledSavePending = false;
 unsigned long ledSaveTime = 0;
@@ -211,6 +217,9 @@ private:
       if (hidLed & 0x02) ledStatus |= 0x04; // Caps Lock (HID bit 1 -> PS/2 bit 2)
       if (hidLed & 0x04) ledStatus |= 0x01; // Scroll Lock (HID bit 2 -> PS/2 bit 0)
       Serial.printf("BLE LED Event received. Raw: 0x%02X -> PS/2: 0x%02X\n", hidLed, ledStatus);
+      // The host is the source of truth for LED state. Mark that the host
+      // controls LEDs so local toggles are disabled (prevents desync).
+      hostControlsLeds = true;
       localLedStatus = ledStatus;
       pendingLedStatus = ledStatus;
       ledUpdatePending = true;
@@ -404,9 +413,23 @@ class BLECallbacks : public NimBLEServerCallbacks {
     // Stop advertising on connect (prevents other hosts from seeing the device
     // while it is in use)
     NimBLEDevice::stopAdvertising();
+    // Reset host LED control flag for the new connection. The new host
+    // may or may not send LED callbacks; we start with local toggle
+    // enabled until we receive the first host callback.
+    hostControlsLeds = false;
   }
   void onDisconnect(NimBLEServer* s) {
-    Serial.println("BLE: disconnected - restarting advertising");
+    Serial.println("BLE: disconnected - resetting HID state and restarting advertising");
+    // Reset all HID state to prevent stuck keys on the next connection
+    modifiers = 0x00;
+    memset(pressedKeys, 0, sizeof(pressedKeys));
+    // Reset PS/2 state machine flags
+    ps2_extended = false;
+    ps2_release = false;
+    ps2_rightCtrl = false;
+    pause_state = 0;
+    // Reset host LED control flag
+    hostControlsLeds = false;
     NimBLEDevice::startAdvertising();
   }
 };
@@ -614,11 +637,16 @@ void processScanCode(uint8_t code) {
 
   if (ps2_rightCtrl && !rel) {
     int newProfile = -1;
+    KeyboardMode targetMode = currentMode;
     switch (code) {
-      case 0x16: newProfile = 0; currentMode = MODE_BT1; break; // Right Ctrl + 1 = BT1
-      case 0x1E: newProfile = 1; currentMode = MODE_BT2; break; // Right Ctrl + 2 = BT2
-      case 0x26: newProfile = 2; currentMode = MODE_BT3; break; // Right Ctrl + 3 = BT3
+      case 0x16: newProfile = 0; targetMode = MODE_BT1; break; // Right Ctrl + 1 = BT1
+      case 0x1E: newProfile = 1; targetMode = MODE_BT2; break; // Right Ctrl + 2 = BT2
+      case 0x26: newProfile = 2; targetMode = MODE_BT3; break; // Right Ctrl + 3 = BT3
       case 0x25: // Right Ctrl + 4 = USB
+        if (currentMode == MODE_USB) {
+          Serial.println("Already in USB mode, ignoring.");
+          return;
+        }
         prefs.begin("keyboard", false);
         prefs.putInt("mode", MODE_USB);
         prefs.end();
@@ -635,6 +663,12 @@ void processScanCode(uint8_t code) {
         break;
     }
     if (newProfile >= 0) {
+      // Skip restart if already in the requested mode
+      if (targetMode == currentMode) {
+        Serial.printf("Already in BT%d mode, ignoring.\n", newProfile + 1);
+        return;
+      }
+      currentMode = targetMode;
       prefs.begin("keyboard", false);
       prefs.putInt("mode", currentMode);
       prefs.end();
@@ -696,7 +730,11 @@ void processScanCode(uint8_t code) {
     return;
   }
 
-  if (currentMode != MODE_USB && !rel) {
+  // In BT mode, toggle LEDs locally ONLY if the host has not sent any LED
+  // callbacks. Once the host sends a callback (hostControlsLeds == true),
+  // the host is the source of truth and local toggles are skipped to
+  // prevent double-toggle desynchronization.
+  if (currentMode != MODE_USB && !rel && !hostControlsLeds) {
     if (hidCode == 0x39) { // Caps Lock
       localLedStatus ^= 0x04;
       pendingLedStatus = localLedStatus;
@@ -731,10 +769,22 @@ void setup() {
   prefs.begin("keyboard", false);
   currentMode = (KeyboardMode)prefs.getInt("mode", MODE_USB);
   
-  // Load the saved LED state for this profile
-  char ledKey[8];
-  sprintf(ledKey, "led_%d", (int)currentMode);
-  localLedStatus = prefs.getUChar(ledKey, 0x02); // 0x02 = Num Lock active by default
+  if (currentMode == MODE_USB) {
+    // In USB mode, load the saved LED state. The host will overwrite it
+    // via the USB HID LED callback once enumerated, but having it here
+    // ensures the physical LEDs show something reasonable during boot.
+    char ledKey[8];
+    sprintf(ledKey, "led_%d", (int)currentMode);
+    localLedStatus = prefs.getUChar(ledKey, 0x02); // 0x02 = Num Lock active by default
+  } else {
+    // In BT mode, DON'T restore saved LED state. Start with all LEDs off.
+    // The host is the only source of truth for lock-key state; restoring a
+    // stale value from flash causes the LEDs to be inverted if the host's
+    // actual state differs (e.g. Caps Lock LED on but host has it off).
+    // The host will send the correct LED state via the BLE output report
+    // once connected and the user presses a lock key.
+    localLedStatus = 0x00;
+  }
   prefs.end();
   pendingLedStatus = localLedStatus;
 
@@ -760,8 +810,8 @@ void setup() {
   pinMode(PS2_CLOCK, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PS2_CLOCK), ps2interrupt, FALLING);
 
-  // Restore the saved LED state for this profile
-  delay(100); // Reduced for faster initialization
+  // Set initial LED state on the physical keyboard
+  delay(100);
   setLeds(localLedStatus);
 
   if (currentMode == MODE_USB) {
@@ -828,8 +878,16 @@ void loop() {
       // Wait 1 second with all 3 LEDs on
       if (millis() - connectionTime > 1000) {
         connState = STATE_CONNECTED;
-        // Restore saved LED state
-        setLeds(localLedStatus);
+        // If the host already sent an LED update during the flash period,
+        // apply the host's value (it's the source of truth). Otherwise,
+        // apply localLedStatus (which is 0x00 in BT mode, or the saved
+        // value in USB mode).
+        if (ledUpdatePending) {
+          ledUpdatePending = false;
+          setLeds(pendingLedStatus);
+        } else {
+          setLeds(localLedStatus);
+        }
       }
     } 
     else {
